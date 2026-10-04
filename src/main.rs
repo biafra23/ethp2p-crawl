@@ -1,3 +1,4 @@
+use anyhow::{Context, anyhow};
 use futures::{SinkExt, StreamExt};
 use reth_chainspec::{Head, MAINNET, SEPOLIA};
 use reth_ecies::ECIESErrorImpl;
@@ -13,6 +14,7 @@ use secp256k1::{SECP256K1, SecretKey, rand};
 use std::io::ErrorKind;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
+use tokio::time::{Duration, timeout};
 
 //
 // Sepolia (port 30405):
@@ -34,70 +36,52 @@ use tokio::net::TcpStream;
 // Address: 188.68.32.16 is the netcup relay, which forwards these ports to zbox. From this machine itself, dial 127.0.0.1 with the same key and port.
 // Pinned in the repo: only the Sepolia enode is pinned on main (in NetworkConfig.java and rust/myotis-net/src/el/reader.rs), and it matches the live one. The mainnet and Gnosis enodes are not pinned anywhere.
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let enode: NodeRecord = std::env::args().nth(1).unwrap().parse()?;
-    // record.id (PeerId), record.address (IpAddr), record.tcp_port
-
+async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
     let our_key = SecretKey::new(&mut rand::thread_rng());
-    let tcp = match TcpStream::connect((enode.address, enode.tcp_port)).await {
-        Ok(tcp) => tcp,
-        Err(e) => {
-            eprintln!("{}:{} | failed to connect: {}", enode.address, enode.tcp_port, e);
-            return Ok(())
-        }
+
+    let tcp = match timeout(Duration::from_secs(5), TcpStream::connect((enode.address, enode.tcp_port))).await {
+        Ok(Ok(tcp)) => tcp,
+        Ok(Err(e)) => return Ok(ProbeOutcome::Unreachable(e.kind())),
+        Err(_) => return Ok(ProbeOutcome::Unreachable(ErrorKind::TimedOut))
     };
-    let ecies = match ECIESStream::connect(tcp, our_key, enode.id).await {
+
+    let ecies = match within(10, "ecies", ECIESStream::connect(tcp, our_key, enode.id)).await? {
         Ok(s) => s,
-        Err(e) => {
-            match e.inner() {
-                ECIESErrorImpl::IO(io)
-                    if matches!(
-                        io.kind(),
-                        ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
-                    ) =>
-                {
-                    eprintln!(
-                        "{}:{} | peer closed during handshake (throttled or full)",
-                        enode.address, enode.tcp_port
-                    );
-                }
-                ECIESErrorImpl::IO(io) => {
-                    eprintln!("{}:{} | network error: {io}", enode.address, enode.tcp_port)
-                }
-                ECIESErrorImpl::TagCheckDecryptFailed | ECIESErrorImpl::InvalidAckData => {
-                    eprintln!(
-                        "{}:{} | key mismatch, enode ID is probably stale",
-                        enode.address, enode.tcp_port
-                    );
-                }
-                other => eprintln!(
-                    "{}:{} | ECIES handshake failed: {other}",
-                    enode.address, enode.tcp_port
-                ),
-            }
-            return Ok(());
-        }
+        Err(e) => return Ok(match e.inner() {
+            ECIESErrorImpl::IO(io) if matches!(io.kind(),ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof) => ProbeOutcome::Reset,
+            ECIESErrorImpl::IO(io) => ProbeOutcome::Unreachable(io.kind()),
+            ECIESErrorImpl::TagCheckDecryptFailed | ECIESErrorImpl::InvalidAckData => ProbeOutcome::KeyMismatch,
+            other => return Err(anyhow!("ecies: {other}")),
+        }),
     };
 
     let our_id = pk2id(&our_key.public_key(SECP256K1));
+    let mut our_hello = HelloMessage::builder(our_id).client_version("myotis/crawl").build();
+    our_hello.try_add_protocol(SnapVersion::V1.into()).ok();
 
-    let mut hello = HelloMessage::builder(our_id)
-        .client_version("myotis/crawl")
-        .build();
-    hello.try_add_protocol(SnapVersion::V1.into()).ok();
-
-    let (mut p2p_stream, their_hello) = match UnauthedP2PStream::new(ecies).handshake(hello).await {
+    let (mut p2p_stream, hello) = match UnauthedP2PStream::new(ecies).handshake(our_hello).await {
         Ok(pair) => pair,
-        Err(P2PStreamError::HandshakeError(P2PHandshakeError::Disconnected(reason))) => {
-            eprintln!(
-                "L83: {}:{} | peer disconnected during handshake: {reason}",
-                enode.address, enode.tcp_port
-            );
-            return Ok(());
-        }
-        Err(e) => return Err(e.into()),
+        Err(e) => return match disconnect_reason(&e) {
+            Some(reason) => Ok(ProbeOutcome::Disconnected { reason, hello: None }),
+            None => Err(e).context("p2p handshake"),
+        },
     };
+
+
+    let snap_versions: Vec<usize> = hello
+        .capabilities
+        .iter()
+        .filter(|cap| cap.name == "snap")
+        .map(|c| c.version)
+        .collect();
+    let snap: Option<usize> = snap_versions.iter().copied().max();
+    println!("Their hello: {:?}", hello);
+    println!("Snap version: {:?}", snap.unwrap_or(0));
+
+    match snap {
+        Some(version) => {println!("Snap version: {:?}", version)}
+        None => {println!("Snap: not advertised")}
+    }
 
     // Handshake done
 
@@ -118,50 +102,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             alloy_rlp::encode(ProtocolMessage::<EthNetworkPrimitives>::from(EthMessage::Status(
                 status.into_message(),
             )))
-            .into(),
+                .into(),
         )
         .await?;
 
-    match p2p_stream.next().await {
-        Some(Ok(message)) => {
-            let theirs = UnifiedStatus::from_message(
-                ProtocolMessage::<EthNetworkPrimitives>::decode_status(
-                    eth_version,
-                    &mut &message[..],
-                )?,
-            );
+    let frame = match within(10, "status", p2p_stream.next()).await? {
+        Some(Ok(frame)) => frame,
+        Some(Err(e)) => return match disconnect_reason(&e) {
+            Some(reason) => Ok(ProbeOutcome::Disconnected { reason, hello: Some(hello) }),
+            None => Err(e).context("reading status"),
+        },
+        None => return Err(anyhow!("stream closed before status")),
+    };
 
-            println!(
-                "chain={} genesis={} fork={:?} head={} range={:?}..{:?}",
-                theirs.chain,
-                theirs.genesis,
-                theirs.forkid,
-                theirs.blockhash,
-                theirs.earliest_block,
-                theirs.latest_block
-            );
-        }
-        Some(Err(e)) => {
-            eprintln!("Error receiving message: {:?}", e);
-        }
-        None => {
-            eprintln!("Stream closed");
-        }
-    }
-
-    //.ok_or("closed")??;
-
-    // a) support snap
-    // -> make a snap query
-
-    // b) does not support snap
-    // -> disconnect
+    let theirs = UnifiedStatus::from_message(
+        ProtocolMessage::<EthNetworkPrimitives>::decode_status(eth_version, &mut &frame[..])
+            .context("decode status")?,
+    );
 
     // Disconnect
     if let Err(e) = p2p_stream.disconnect(DisconnectReason::ClientQuitting).await {
         eprintln!("Disconnect failed: {:?}", e);
     }
+    Ok(ProbeOutcome::Probed { hello: hello, status: theirs })
+}
 
+#[derive(Debug)]
+pub enum ProbeOutcome {
+    Unreachable(ErrorKind), // TCP: refused / timed out / host unreachable
+    Reset,                  // ECIES: peer closed (throttled or full)
+    KeyMismatch,            // ECIES: enode ID is stale
+    Disconnected { reason: DisconnectReason, hello: Option<HelloMessage> },
+    Probed { hello: HelloMessage, status: UnifiedStatus },
+}
+
+#[derive(Debug)]
+pub enum SnapCheck {
+    NotShared,
+    Served(usize),
+    Empty,
+    Timeout,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let enode: NodeRecord = std::env::args().nth(1).unwrap().parse()?;
+    // record.id (PeerId), record.address (IpAddr), record.tcp_port
+
+    match tokio::time::timeout(Duration::from_secs(30), probe(enode)).await {
+        Ok(Ok(outcome)) => println!("{outcome:?}"),
+        Ok(Err(e)) => eprintln!("probe failed: {e:#}"),
+        Err(_) => eprintln!("probe timed out"),
+    }
     Ok(())
 }
 
@@ -190,5 +182,17 @@ impl SnapVersion {
 impl From<SnapVersion> for Protocol {
     fn from(v: SnapVersion) -> Self {
         v.protocol()
+    }
+}
+
+async fn within<T>(secs: u64, what: &str, fut: impl Future<Output=T>) -> anyhow::Result<T> {
+    timeout(Duration::from_secs(secs), fut).await.map_err(|_| anyhow!("{what}: timed out"))
+}
+
+fn disconnect_reason(e: &P2PStreamError) -> Option<DisconnectReason> {
+    match e {
+        P2PStreamError::Disconnected(r) => Some(*r),
+        P2PStreamError::HandshakeError(P2PHandshakeError::Disconnected(r)) => Some(*r),
+        _ => None,
     }
 }
