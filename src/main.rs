@@ -1,7 +1,7 @@
 use reth_ecies::stream::ECIESStream;
-use reth_eth_wire::{HelloMessage, UnauthedEthStream, UnauthedP2PStream, DisconnectReason};
-use reth_network_peers::NodeRecord;
-use secp256k1::{SecretKey, rand};
+use reth_eth_wire::{DisconnectReason, HelloMessage, UnauthedP2PStream};
+use reth_network_peers::{NodeRecord, pk2id};
+use secp256k1::{SECP256K1, SecretKey, rand};
 use tokio::net::TcpStream;
 
 //
@@ -19,18 +19,14 @@ use tokio::net::TcpStream;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Hello, world!");
-
     let enode: NodeRecord = std::env::args().nth(1).unwrap().parse()?;
     // record.id (PeerId), record.address (IpAddr), record.tcp_port
-
-    println!("Parsed enode: {:?}", enode);
 
     let our_key = SecretKey::new(&mut rand::thread_rng());
     let tcp = TcpStream::connect((enode.address, enode.tcp_port)).await?;
     let ecies = ECIESStream::connect(tcp, our_key, enode.id).await?;
 
-    let our_pub_key_as_peer_id = enode.id;
+    let our_pub_key_as_peer_id = pk2id(&our_key.public_key(SECP256K1));
 
     let hello = HelloMessage::builder(our_pub_key_as_peer_id).build();
 
@@ -43,10 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let snap: Option<usize> = snap_versions.iter().copied().max();
     println!("Their hello: {:?}", their_hello);
-    println!("Snap: {:?}", snap);
+    println!("Snap version: {:?}", snap.unwrap_or(0));
 
-
-    let _ = p2p_stream.disconnect(DisconnectReason::ClientQuitting);
+    if let Err(e) = p2p_stream.disconnect(DisconnectReason::ClientQuitting).await {
+        eprintln!("Disconnect failed: {:?}", e);
+    }
 
     Ok(())
 }
