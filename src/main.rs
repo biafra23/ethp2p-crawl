@@ -5,9 +5,7 @@ use reth_ecies::ECIESErrorImpl;
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::errors::{P2PHandshakeError, P2PStreamError};
 use reth_eth_wire::protocol::Protocol;
-use reth_eth_wire::{
-    Capability, EthMessage, EthNetworkPrimitives, P2PStream, ProtocolMessage, UnifiedStatus,
-};
+use reth_eth_wire::{AccountRangeMessage, Capability, EthMessage, EthMessageID, EthNetworkPrimitives, EthVersion, GetAccountRangeMessage, GetBlockHeaders, HeadersDirection, P2PStream, ProtocolMessage, SnapMessageId, UnifiedStatus};
 use reth_eth_wire::{DisconnectReason, HelloMessage, UnauthedP2PStream};
 use reth_network_peers::{NodeRecord, pk2id};
 use secp256k1::{SECP256K1, SecretKey, rand};
@@ -15,7 +13,12 @@ use std::io::ErrorKind;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
+use alloy_primitives::B256;
+use alloy_rlp::{Decodable, Encodable};
+use bytes::BytesMut;
+use reth_eth_wire::message::RequestPair;
 
+type P2p = P2PStream<ECIESStream<TcpStream>>;
 //
 // Sepolia (port 30405):
 // mine:
@@ -67,24 +70,6 @@ async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
         },
     };
 
-
-    let snap_versions: Vec<usize> = hello
-        .capabilities
-        .iter()
-        .filter(|cap| cap.name == "snap")
-        .map(|c| c.version)
-        .collect();
-    let snap: Option<usize> = snap_versions.iter().copied().max();
-    println!("Their hello: {:?}", hello);
-    println!("Snap version: {:?}", snap.unwrap_or(0));
-
-    match snap {
-        Some(version) => {println!("Snap version: {:?}", version)}
-        None => {println!("Snap: not advertised")}
-    }
-
-    // Handshake done
-
     let caps = p2p_stream.shared_capabilities();
     let eth_version = caps.eth_version()?;
     let snap_off = caps.find(&SnapVersion::V1.capability()).map(|c| c.relative_message_id_offset()); // None => peer didn't share snap
@@ -92,7 +77,7 @@ async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
     // let spec = match chain_arg { "sepolia" => SEPOLIA.as_ref(), _ => MAINNET.as_ref() };
     let spec = SEPOLIA.as_ref(); //SEPOLIA
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let head = Head { number: 1_735_371, timestamp: now, ..Default::default() }; //SEPOLIA
+    let head = Head { number: 10_000_000, timestamp: now, hash: spec.genesis_hash(), ..Default::default() }; //SEPOLIA
     let mut status = UnifiedStatus::spec_builder(spec, &head);
     status.set_eth_version(eth_version);
 
@@ -120,11 +105,18 @@ async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
             .context("decode status")?,
     );
 
+    println!("theirs.forkId: {:?} status.forkId: {:?}", theirs.forkid, status.forkid);
+
+    let snap = match snap_off {
+        None => SnapCheck::NotShared,
+        Some(off) => snap_check(&mut p2p_stream, eth_version, off, theirs.blockhash).await?,
+    };
+
     // Disconnect
     if let Err(e) = p2p_stream.disconnect(DisconnectReason::ClientQuitting).await {
         eprintln!("Disconnect failed: {:?}", e);
     }
-    Ok(ProbeOutcome::Probed { hello: hello, status: theirs })
+    Ok(ProbeOutcome::Probed { hello: hello, status: theirs, snap: snap })
 }
 
 #[derive(Debug)]
@@ -133,15 +125,16 @@ pub enum ProbeOutcome {
     Reset,                  // ECIES: peer closed (throttled or full)
     KeyMismatch,            // ECIES: enode ID is stale
     Disconnected { reason: DisconnectReason, hello: Option<HelloMessage> },
-    Probed { hello: HelloMessage, status: UnifiedStatus },
+    Probed { hello: HelloMessage, status: UnifiedStatus, snap: SnapCheck },
 }
 
 #[derive(Debug)]
 pub enum SnapCheck {
-    NotShared,
-    Served(usize),
-    Empty,
+    NotShared,                                      // no snap in shared capabilities
+    Served { accounts: usize, proof_nodes: usize }, // real data for the head root
+    Empty,                                          // answered, but nothing for that root
     Timeout,
+    Disconnected(DisconnectReason),
 }
 
 #[tokio::main]
@@ -149,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
     let enode: NodeRecord = std::env::args().nth(1).unwrap().parse()?;
     // record.id (PeerId), record.address (IpAddr), record.tcp_port
 
-    match tokio::time::timeout(Duration::from_secs(30), probe(enode)).await {
+    match tokio::time::timeout(Duration::from_secs(45), probe(enode)).await {
         Ok(Ok(outcome)) => println!("{outcome:?}"),
         Ok(Err(e)) => eprintln!("probe failed: {e:#}"),
         Err(_) => eprintln!("probe timed out"),
@@ -194,5 +187,84 @@ fn disconnect_reason(e: &P2PStreamError) -> Option<DisconnectReason> {
         P2PStreamError::Disconnected(r) => Some(*r),
         P2PStreamError::HandshakeError(P2PHandshakeError::Disconnected(r)) => Some(*r),
         _ => None,
+    }
+}
+
+async fn snap_check(
+    p2p: &mut P2p,
+    eth_version: EthVersion,
+    snap_off: u8,
+    head_hash: B256,
+) -> anyhow::Result<SnapCheck> {
+    // 1. head header → state root
+    let req = EthMessage::<EthNetworkPrimitives>::GetBlockHeaders(RequestPair {
+        request_id: 1,
+        message: GetBlockHeaders {
+            start_block: head_hash.into(),
+            limit: 1,
+            skip: 0,
+            direction: HeadersDirection::Rising,
+        },
+    });
+    p2p.send(alloy_rlp::encode(ProtocolMessage::from(req)).into()).await.context("send GetBlockHeaders")?;
+
+    let state_root = match wait_for(p2p, EthMessageID::BlockHeaders.to_u8(), 10).await? {
+        Recv::Timeout => return Ok(SnapCheck::Timeout),
+        Recv::Disconnected(r) => return Ok(SnapCheck::Disconnected(r)),
+        Recv::Frame(frame) => {
+            let msg = ProtocolMessage::<EthNetworkPrimitives>::decode_message(eth_version, &mut &frame[..])
+                .context("decode BlockHeaders")?;
+            match msg.message {
+                EthMessage::BlockHeaders(RequestPair { request_id: 1, message }) => {
+                    message.0.into_iter().next().context("empty BlockHeaders")?.state_root
+                }
+                other => return Err(anyhow!("unexpected eth message: {other:?}")),
+            }
+        }
+    };
+
+    // 2. GetAccountRange at that root
+    let req = GetAccountRangeMessage {
+        request_id: 2,
+        root_hash: state_root,
+        starting_hash: B256::ZERO,
+        limit_hash: B256::repeat_byte(0xff),
+        response_bytes: 1024,
+    };
+    let mut frame = vec![snap_off + SnapMessageId::GetAccountRange as u8];
+    req.encode(&mut frame);
+    p2p.send(frame.into()).await.context("send GetAccountRange")?;
+
+    match wait_for(p2p, snap_off + SnapMessageId::AccountRange as u8, 10).await? {
+        Recv::Timeout => Ok(SnapCheck::Timeout),
+        Recv::Disconnected(r) => Ok(SnapCheck::Disconnected(r)),
+        Recv::Frame(frame) => {
+            let resp = AccountRangeMessage::decode(&mut &frame[1..]).context("decode AccountRange")?;
+            if resp.request_id != 2 {
+                return Err(anyhow!("AccountRange for unknown request id {}", resp.request_id));
+            }
+            if resp.accounts.is_empty() {
+                Ok(SnapCheck::Empty)
+            } else {
+                Ok(SnapCheck::Served { accounts: resp.accounts.len(), proof_nodes: resp.proof.len() })
+            }
+        }
+    }
+}
+enum Recv { Frame(BytesMut), Disconnected(DisconnectReason), Timeout }
+
+async fn wait_for(p2p: &mut P2p, want_id: u8, secs: u64) -> anyhow::Result<Recv> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        match tokio::time::timeout_at(deadline, p2p.next()).await {
+            Err(_) => return Ok(Recv::Timeout),
+            Ok(None) => return Err(anyhow!("stream closed")),
+            Ok(Some(Err(e))) => return match disconnect_reason(&e) {
+                Some(r) => Ok(Recv::Disconnected(r)),
+                None => Err(e).context("reading frame"),
+            },
+            Ok(Some(Ok(frame))) if frame.first() == Some(&want_id) => return Ok(Recv::Frame(frame)),
+            Ok(Some(Ok(_))) => continue,
+        }
     }
 }

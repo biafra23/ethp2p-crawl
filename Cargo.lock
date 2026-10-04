@@ -1576,6 +1576,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "anyhow",
+ "bytes",
  "futures",
  "rand 0.8.8",
  "reth-chainspec",
