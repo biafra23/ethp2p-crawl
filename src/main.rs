@@ -1,8 +1,9 @@
 use reth_ecies::stream::ECIESStream;
-use reth_eth_wire::{HelloMessage, UnauthedEthStream, UnauthedP2PStream};
+use reth_eth_wire::{HelloMessage, UnauthedEthStream, UnauthedP2PStream, DisconnectReason};
 use reth_network_peers::NodeRecord;
 use secp256k1::{SecretKey, rand};
 use tokio::net::TcpStream;
+
 //
 // Sepolia (port 30405):
 // enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@188.68.32.16:30405
@@ -33,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let hello = HelloMessage::builder(our_pub_key_as_peer_id).build();
 
-    let (p2p_stream, their_hello) = UnauthedP2PStream::new(ecies).handshake(hello).await?;
+    let (mut p2p_stream, their_hello) = UnauthedP2PStream::new(ecies).handshake(hello).await?;
     let snap_versions: Vec<usize> = their_hello
         .capabilities
         .iter()
@@ -43,6 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let snap: Option<usize> = snap_versions.iter().copied().max();
     println!("Their hello: {:?}", their_hello);
     println!("Snap: {:?}", snap);
+
+
+    let _ = p2p_stream.disconnect(DisconnectReason::ClientQuitting);
 
     Ok(())
 }
