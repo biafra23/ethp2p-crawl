@@ -1,8 +1,8 @@
-use tokio::net::TcpStream;
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::{HelloMessage, UnauthedEthStream, UnauthedP2PStream};
 use reth_network_peers::NodeRecord;
-use secp256k1::{rand, SecretKey};
+use secp256k1::{SecretKey, rand};
+use tokio::net::TcpStream;
 //
 // Sepolia (port 30405):
 // enode://cfd3572bd7691fe03baf52106b873e01d9b5dca1714a74b316cb94151127dfd20adae3be559e3e6b44b78a5af1ed6f92ecc8676a2555fc7cdb2d29a0c37e1b2c@188.68.32.16:30405
@@ -16,7 +16,6 @@ use secp256k1::{rand, SecretKey};
 // Address: 188.68.32.16 is the netcup relay, which forwards these ports to zbox. From this machine itself, dial 127.0.0.1 with the same key and port.
 // Pinned in the repo: only the Sepolia enode is pinned on main (in NetworkConfig.java and rust/myotis-net/src/el/reader.rs), and it matches the live one. The mainnet and Gnosis enodes are not pinned anywhere.
 
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
@@ -26,22 +25,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Parsed enode: {:?}", enode);
 
-
     let our_key = SecretKey::new(&mut rand::thread_rng());
     let tcp = TcpStream::connect((enode.address, enode.tcp_port)).await?;
     let ecies = ECIESStream::connect(tcp, our_key, enode.id).await?;
 
     let our_pub_key_as_peer_id = enode.id;
 
-    let hello = HelloMessage::builder(our_pub_key_as_peer_id)
-        .build();
+    let hello = HelloMessage::builder(our_pub_key_as_peer_id).build();
 
     let (p2p_stream, their_hello) = UnauthedP2PStream::new(ecies).handshake(hello).await?;
-
+    let snap_versions: Vec<usize> = their_hello
+        .capabilities
+        .iter()
+        .filter(|cap| cap.name == "snap")
+        .map(|c| c.version)
+        .collect();
+    let snap: Option<usize> = snap_versions.iter().copied().max();
     println!("Their hello: {:?}", their_hello);
-
+    println!("Snap: {:?}", snap);
 
     Ok(())
 }
-
-
