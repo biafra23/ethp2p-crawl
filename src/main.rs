@@ -39,7 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let snap: Option<usize> = snap_versions.iter().copied().max();
     println!("Their hello: {:?}", their_hello);
-    println!("Snap version: {:?}", snap.unwrap_or(0));
+
+    match snap {
+        Some(version) => {println!("Snap version: {:?}", version)}
+        None => {println!("Snap: not advertised")}
+    }
 
     if let Err(e) = p2p_stream.disconnect(DisconnectReason::ClientQuitting).await {
         eprintln!("Disconnect failed: {:?}", e);
