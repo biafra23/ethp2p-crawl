@@ -2,8 +2,11 @@ use futures::{SinkExt, StreamExt};
 use reth_chainspec::{Head, MAINNET, SEPOLIA};
 use reth_ecies::ECIESErrorImpl;
 use reth_ecies::stream::ECIESStream;
+use reth_eth_wire::errors::{P2PHandshakeError, P2PStreamError};
 use reth_eth_wire::protocol::Protocol;
-use reth_eth_wire::{Capability, EthMessage, EthNetworkPrimitives, ProtocolMessage, UnifiedStatus};
+use reth_eth_wire::{
+    Capability, EthMessage, EthNetworkPrimitives, P2PStream, ProtocolMessage, UnifiedStatus,
+};
 use reth_eth_wire::{DisconnectReason, HelloMessage, UnauthedP2PStream};
 use reth_network_peers::{NodeRecord, pk2id};
 use secp256k1::{SECP256K1, SecretKey, rand};
@@ -37,7 +40,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // record.id (PeerId), record.address (IpAddr), record.tcp_port
 
     let our_key = SecretKey::new(&mut rand::thread_rng());
-    let tcp = TcpStream::connect((enode.address, enode.tcp_port)).await?;
+    let tcp = match TcpStream::connect((enode.address, enode.tcp_port)).await {
+        Ok(tcp) => tcp,
+        Err(e) => {
+            eprintln!("{}:{} | failed to connect: {}", enode.address, enode.tcp_port, e);
+            return Ok(())
+        }
+    };
     let ecies = match ECIESStream::connect(tcp, our_key, enode.id).await {
         Ok(s) => s,
         Err(e) => {
@@ -73,28 +82,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let our_id = pk2id(&our_key.public_key(SECP256K1));
 
-    let mut hello = HelloMessage::builder(our_id).client_version("myotis/crawl").build();
-    // SnapVersion::V1 does not exist anymore
+    let mut hello = HelloMessage::builder(our_id)
+        .client_version("myotis/crawl")
+        .build();
     hello.try_add_protocol(SnapVersion::V1.into()).ok();
 
-    let (mut p2p_stream, their_hello) = UnauthedP2PStream::new(ecies).handshake(hello).await?;
-    let snap_versions: Vec<usize> = their_hello
-        .capabilities
-        .iter()
-        .filter(|cap| cap.name == "snap")
-        .map(|c| c.version)
-        .collect();
-    let snap: Option<usize> = snap_versions.iter().copied().max();
-    println!("Their hello: {:?}", their_hello);
+    let (mut p2p_stream, their_hello) = match UnauthedP2PStream::new(ecies).handshake(hello).await {
+        Ok(pair) => pair,
+        Err(P2PStreamError::HandshakeError(P2PHandshakeError::Disconnected(reason))) => {
+            eprintln!(
+                "L83: {}:{} | peer disconnected during handshake: {reason}",
+                enode.address, enode.tcp_port
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
 
-    match snap {
-        Some(version) => {
-            println!("Snap version: {:?}", version)
-        }
-        None => {
-            println!("Snap: not advertised")
-        }
-    }
     // Handshake done
 
     let caps = p2p_stream.shared_capabilities();
@@ -118,20 +122,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let bytes = p2p_stream.next().await.ok_or("closed")??;
-    let theirs = UnifiedStatus::from_message(
-        ProtocolMessage::<EthNetworkPrimitives>::decode_status(eth_version, &mut &bytes[..])?,
-    );
+    match p2p_stream.next().await {
+        Some(Ok(message)) => {
+            let theirs = UnifiedStatus::from_message(
+                ProtocolMessage::<EthNetworkPrimitives>::decode_status(
+                    eth_version,
+                    &mut &message[..],
+                )?,
+            );
 
-    println!(
-        "chain={} genesis={} fork={:?} head={} range={:?}..{:?}",
-        theirs.chain,
-        theirs.genesis,
-        theirs.forkid,
-        theirs.blockhash,
-        theirs.earliest_block,
-        theirs.latest_block
-    );
+            println!(
+                "chain={} genesis={} fork={:?} head={} range={:?}..{:?}",
+                theirs.chain,
+                theirs.genesis,
+                theirs.forkid,
+                theirs.blockhash,
+                theirs.earliest_block,
+                theirs.latest_block
+            );
+        }
+        Some(Err(e)) => {
+            eprintln!("Error receiving message: {:?}", e);
+        }
+        None => {
+            eprintln!("Stream closed");
+        }
+    }
+
+    //.ok_or("closed")??;
+
+    // a) support snap
+    // -> make a snap query
+
+    // b) does not support snap
+    // -> disconnect
 
     // Disconnect
     if let Err(e) = p2p_stream.disconnect(DisconnectReason::ClientQuitting).await {
