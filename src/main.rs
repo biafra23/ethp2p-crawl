@@ -1,3 +1,5 @@
+use std::io::ErrorKind;
+use reth_ecies::ECIESErrorImpl;
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::{DisconnectReason, HelloMessage, UnauthedP2PStream};
 use reth_network_peers::{NodeRecord, pk2id};
@@ -24,7 +26,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let our_key = SecretKey::new(&mut rand::thread_rng());
     let tcp = TcpStream::connect((enode.address, enode.tcp_port)).await?;
-    let ecies = ECIESStream::connect(tcp, our_key, enode.id).await?;
+    let ecies = match ECIESStream::connect(tcp, our_key, enode.id).await {
+        Ok(s) => s,
+        Err(e) => {
+            match e.inner() {
+                ECIESErrorImpl::IO(io) if matches!(io.kind(), ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof) => {
+                    eprintln!("{}:{} | peer closed during handshake (throttled or full)", enode.address, enode.tcp_port);
+                }
+                ECIESErrorImpl::IO(io) => eprintln!("{}:{} | network error: {io}", enode.address, enode.tcp_port),
+                ECIESErrorImpl::TagCheckDecryptFailed | ECIESErrorImpl::InvalidAckData => {
+                    eprintln!("{}:{} | key mismatch, enode ID is probably stale", enode.address, enode.tcp_port);
+                }
+                other => eprintln!("{}:{} | ECIES handshake failed: {other}", enode.address, enode.tcp_port),
+            }
+            return Ok(())
+        }
+    };
 
     let our_pub_key_as_peer_id = pk2id(&our_key.public_key(SECP256K1));
 
