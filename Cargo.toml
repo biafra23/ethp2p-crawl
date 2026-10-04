@@ -1,0 +1,16 @@
+[package]
+name = "ethp2p-crawl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ecies = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+tokio = { version = "1.53.2", features = ["full"] }
+tokio-stream = "0.1.19"
+
+futures = "0.3.34"
+anyhow = "1"
+secp256k1 = { version = "0.30", features = ["rand"] }
+rand = "0.8"
