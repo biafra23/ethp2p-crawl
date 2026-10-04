@@ -7,6 +7,10 @@ edition = "2024"
 reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-ecies = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+
+
 tokio = { version = "1.53.2", features = ["full"] }
 tokio-stream = "0.1.19"
 
@@ -14,3 +18,5 @@ futures = "0.3.34"
 anyhow = "1"
 secp256k1 = { version = "0.30", features = ["rand"] }
 rand = "0.8"
+alloy-primitives    = "1.6"
+alloy-rlp           = "0.3"

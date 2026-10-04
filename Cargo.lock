@@ -221,6 +221,7 @@ dependencies = [
  "alloy-primitives",
  "auto_impl",
  "dyn-clone",
+ "serde",
 ]
 
 [[package]]
@@ -1572,11 +1573,15 @@ dependencies = [
 name = "ethp2p-crawl"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
  "anyhow",
  "futures",
  "rand 0.8.8",
+ "reth-chainspec",
  "reth-ecies",
  "reth-eth-wire",
+ "reth-ethereum-forks",
  "reth-network-peers",
  "secp256k1 0.30.0",
  "tokio",
