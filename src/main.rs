@@ -161,7 +161,12 @@ pub enum SnapCheck {
     Served { accounts: usize, proof_nodes: usize }, // real data for the head root
     Empty,                                          // answered, but nothing for that root
     Timeout,
-    Disconnected(DisconnectReason),
+    Disconnected { reason: DisconnectReason, stage: Stage },
+}
+#[derive(Debug)]
+pub enum Stage {
+    Headers,
+    AccountRange,
 }
 
 #[tokio::main]
@@ -169,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
     let enode: NodeRecord = std::env::args().nth(1).unwrap().parse()?;
     // record.id (PeerId), record.address (IpAddr), record.tcp_port
 
-    match tokio::time::timeout(Duration::from_secs(45), probe(enode)).await {
+    match tokio::time::timeout(Duration::from_secs(65), probe(enode)).await {
         Ok(Ok(outcome)) => println!("{outcome:?}"),
         Ok(Err(e)) => eprintln!("probe failed: {e:#}"),
         Err(_) => eprintln!("probe timed out"),
@@ -239,7 +244,9 @@ async fn snap_check(
 
     let state_root = match wait_for(p2p, EthMessageID::BlockHeaders.to_u8(), 10).await? {
         Recv::Timeout => return Ok(SnapCheck::Timeout),
-        Recv::Disconnected(r) => return Ok(SnapCheck::Disconnected(r)),
+        Recv::Disconnected(r) => {
+            return Ok(SnapCheck::Disconnected { reason: r, stage: Stage::Headers });
+        }
         Recv::Frame(frame) => {
             let msg = ProtocolMessage::<EthNetworkPrimitives>::decode_message(
                 eth_version,
@@ -269,7 +276,9 @@ async fn snap_check(
 
     match wait_for(p2p, snap_off + SnapMessageId::AccountRange as u8, 10).await? {
         Recv::Timeout => Ok(SnapCheck::Timeout),
-        Recv::Disconnected(r) => Ok(SnapCheck::Disconnected(r)),
+        Recv::Disconnected(r) => {
+            Ok(SnapCheck::Disconnected { reason: r, stage: Stage::AccountRange })
+        }
         Recv::Frame(frame) => {
             let resp =
                 AccountRangeMessage::decode(&mut &frame[1..]).context("decode AccountRange")?;
