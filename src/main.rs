@@ -1,11 +1,19 @@
+use alloy_primitives::B256;
+use alloy_rlp::{Decodable, Encodable};
 use anyhow::{Context, anyhow};
+use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use reth_chainspec::{Head, MAINNET, SEPOLIA};
 use reth_ecies::ECIESErrorImpl;
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::errors::{P2PHandshakeError, P2PStreamError};
+use reth_eth_wire::message::RequestPair;
 use reth_eth_wire::protocol::Protocol;
-use reth_eth_wire::{AccountRangeMessage, Capability, EthMessage, EthMessageID, EthNetworkPrimitives, EthVersion, GetAccountRangeMessage, GetBlockHeaders, HeadersDirection, P2PStream, ProtocolMessage, SnapMessageId, UnifiedStatus};
+use reth_eth_wire::{
+    AccountRangeMessage, Capability, EthMessage, EthMessageID, EthNetworkPrimitives, EthVersion,
+    GetAccountRangeMessage, GetBlockHeaders, HeadersDirection, P2PStream, ProtocolMessage,
+    SnapMessageId, UnifiedStatus,
+};
 use reth_eth_wire::{DisconnectReason, HelloMessage, UnauthedP2PStream};
 use reth_network_peers::{NodeRecord, pk2id};
 use secp256k1::{SECP256K1, SecretKey, rand};
@@ -13,10 +21,6 @@ use std::io::ErrorKind;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
-use alloy_primitives::B256;
-use alloy_rlp::{Decodable, Encodable};
-use bytes::BytesMut;
-use reth_eth_wire::message::RequestPair;
 
 type P2p = P2PStream<ECIESStream<TcpStream>>;
 //
@@ -42,20 +46,34 @@ type P2p = P2PStream<ECIESStream<TcpStream>>;
 async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
     let our_key = SecretKey::new(&mut rand::thread_rng());
 
-    let tcp = match timeout(Duration::from_secs(5), TcpStream::connect((enode.address, enode.tcp_port))).await {
-        Ok(Ok(tcp)) => tcp,
-        Ok(Err(e)) => return Ok(ProbeOutcome::Unreachable(e.kind())),
-        Err(_) => return Ok(ProbeOutcome::Unreachable(ErrorKind::TimedOut))
-    };
+    let tcp =
+        match timeout(Duration::from_secs(5), TcpStream::connect((enode.address, enode.tcp_port)))
+            .await
+        {
+            Ok(Ok(tcp)) => tcp,
+            Ok(Err(e)) => return Ok(ProbeOutcome::Unreachable(e.kind())),
+            Err(_) => return Ok(ProbeOutcome::Unreachable(ErrorKind::TimedOut)),
+        };
 
     let ecies = match within(10, "ecies", ECIESStream::connect(tcp, our_key, enode.id)).await? {
         Ok(s) => s,
-        Err(e) => return Ok(match e.inner() {
-            ECIESErrorImpl::IO(io) if matches!(io.kind(),ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof) => ProbeOutcome::Reset,
-            ECIESErrorImpl::IO(io) => ProbeOutcome::Unreachable(io.kind()),
-            ECIESErrorImpl::TagCheckDecryptFailed | ECIESErrorImpl::InvalidAckData => ProbeOutcome::KeyMismatch,
-            other => return Err(anyhow!("ecies: {other}")),
-        }),
+        Err(e) => {
+            return Ok(match e.inner() {
+                ECIESErrorImpl::IO(io)
+                    if matches!(
+                        io.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    ProbeOutcome::Reset
+                }
+                ECIESErrorImpl::IO(io) => ProbeOutcome::Unreachable(io.kind()),
+                ECIESErrorImpl::TagCheckDecryptFailed | ECIESErrorImpl::InvalidAckData => {
+                    ProbeOutcome::KeyMismatch
+                }
+                other => return Err(anyhow!("ecies: {other}")),
+            });
+        }
     };
 
     let our_id = pk2id(&our_key.public_key(SECP256K1));
@@ -64,10 +82,12 @@ async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
 
     let (mut p2p_stream, hello) = match UnauthedP2PStream::new(ecies).handshake(our_hello).await {
         Ok(pair) => pair,
-        Err(e) => return match disconnect_reason(&e) {
-            Some(reason) => Ok(ProbeOutcome::Disconnected { reason, hello: None }),
-            None => Err(e).context("p2p handshake"),
-        },
+        Err(e) => {
+            return match disconnect_reason(&e) {
+                Some(reason) => Ok(ProbeOutcome::Disconnected { reason, hello: None }),
+                None => Err(e).context("p2p handshake"),
+            };
+        }
     };
 
     let caps = p2p_stream.shared_capabilities();
@@ -77,7 +97,12 @@ async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
     // let spec = match chain_arg { "sepolia" => SEPOLIA.as_ref(), _ => MAINNET.as_ref() };
     let spec = SEPOLIA.as_ref(); //SEPOLIA
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let head = Head { number: 10_000_000, timestamp: now, hash: spec.genesis_hash(), ..Default::default() }; //SEPOLIA
+    let head = Head {
+        number: 10_000_000,
+        timestamp: now,
+        hash: spec.genesis_hash(),
+        ..Default::default()
+    }; //SEPOLIA
     let mut status = UnifiedStatus::spec_builder(spec, &head);
     status.set_eth_version(eth_version);
 
@@ -87,16 +112,18 @@ async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
             alloy_rlp::encode(ProtocolMessage::<EthNetworkPrimitives>::from(EthMessage::Status(
                 status.into_message(),
             )))
-                .into(),
+            .into(),
         )
         .await?;
 
     let frame = match within(10, "status", p2p_stream.next()).await? {
         Some(Ok(frame)) => frame,
-        Some(Err(e)) => return match disconnect_reason(&e) {
-            Some(reason) => Ok(ProbeOutcome::Disconnected { reason, hello: Some(hello) }),
-            None => Err(e).context("reading status"),
-        },
+        Some(Err(e)) => {
+            return match disconnect_reason(&e) {
+                Some(reason) => Ok(ProbeOutcome::Disconnected { reason, hello: Some(hello) }),
+                None => Err(e).context("reading status"),
+            };
+        }
         None => return Err(anyhow!("stream closed before status")),
     };
 
@@ -178,7 +205,7 @@ impl From<SnapVersion> for Protocol {
     }
 }
 
-async fn within<T>(secs: u64, what: &str, fut: impl Future<Output=T>) -> anyhow::Result<T> {
+async fn within<T>(secs: u64, what: &str, fut: impl Future<Output = T>) -> anyhow::Result<T> {
     timeout(Duration::from_secs(secs), fut).await.map_err(|_| anyhow!("{what}: timed out"))
 }
 
@@ -206,14 +233,19 @@ async fn snap_check(
             direction: HeadersDirection::Rising,
         },
     });
-    p2p.send(alloy_rlp::encode(ProtocolMessage::from(req)).into()).await.context("send GetBlockHeaders")?;
+    p2p.send(alloy_rlp::encode(ProtocolMessage::from(req)).into())
+        .await
+        .context("send GetBlockHeaders")?;
 
     let state_root = match wait_for(p2p, EthMessageID::BlockHeaders.to_u8(), 10).await? {
         Recv::Timeout => return Ok(SnapCheck::Timeout),
         Recv::Disconnected(r) => return Ok(SnapCheck::Disconnected(r)),
         Recv::Frame(frame) => {
-            let msg = ProtocolMessage::<EthNetworkPrimitives>::decode_message(eth_version, &mut &frame[..])
-                .context("decode BlockHeaders")?;
+            let msg = ProtocolMessage::<EthNetworkPrimitives>::decode_message(
+                eth_version,
+                &mut &frame[..],
+            )
+            .context("decode BlockHeaders")?;
             match msg.message {
                 EthMessage::BlockHeaders(RequestPair { request_id: 1, message }) => {
                     message.0.into_iter().next().context("empty BlockHeaders")?.state_root
@@ -239,32 +271,47 @@ async fn snap_check(
         Recv::Timeout => Ok(SnapCheck::Timeout),
         Recv::Disconnected(r) => Ok(SnapCheck::Disconnected(r)),
         Recv::Frame(frame) => {
-            let resp = AccountRangeMessage::decode(&mut &frame[1..]).context("decode AccountRange")?;
+            let resp =
+                AccountRangeMessage::decode(&mut &frame[1..]).context("decode AccountRange")?;
             if resp.request_id != 2 {
                 return Err(anyhow!("AccountRange for unknown request id {}", resp.request_id));
             }
             if resp.accounts.is_empty() {
                 Ok(SnapCheck::Empty)
             } else {
-                Ok(SnapCheck::Served { accounts: resp.accounts.len(), proof_nodes: resp.proof.len() })
+                Ok(SnapCheck::Served {
+                    accounts: resp.accounts.len(),
+                    proof_nodes: resp.proof.len(),
+                })
             }
         }
     }
 }
-enum Recv { Frame(BytesMut), Disconnected(DisconnectReason), Timeout }
+enum Recv {
+    Frame(BytesMut),
+    Disconnected(DisconnectReason),
+    Timeout,
+}
 
 async fn wait_for(p2p: &mut P2p, want_id: u8, secs: u64) -> anyhow::Result<Recv> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
-        match tokio::time::timeout_at(deadline, p2p.next()).await {
-            Err(_) => return Ok(Recv::Timeout),
-            Ok(None) => return Err(anyhow!("stream closed")),
-            Ok(Some(Err(e))) => return match disconnect_reason(&e) {
-                Some(r) => Ok(Recv::Disconnected(r)),
-                None => Err(e).context("reading frame"),
+        let tick = tokio::time::sleep(Duration::from_millis(500));
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return Ok(Recv::Timeout),
+            _ = tick => { p2p.flush().await.context("flush")?; },
+            item = p2p.next() => {
+                p2p.flush().await.context("flush")?;
+                match item {
+                None => return Err(anyhow!("stream closed")),
+                Some(Err(e)) => return match disconnect_reason(&e) {
+                    Some(r) => Ok(Recv::Disconnected(r)),
+                    None => Err(e).context("reading frame"),
+                },
+                Some(Ok(frame)) if frame.first() == Some(&want_id) => return Ok(Recv::Frame(frame)),
+                Some(Ok(_)) => {}
+            }
             },
-            Ok(Some(Ok(frame))) if frame.first() == Some(&want_id) => return Ok(Recv::Frame(frame)),
-            Ok(Some(Ok(_))) => continue,
         }
     }
 }
