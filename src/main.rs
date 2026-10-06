@@ -1,5 +1,4 @@
 use alloy_primitives::B256;
-use alloy_rlp::{Decodable, Encodable};
 use anyhow::{Context, anyhow};
 use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
@@ -17,10 +16,20 @@ use reth_eth_wire::{
 use reth_eth_wire::{DisconnectReason, HelloMessage, UnauthedP2PStream};
 use reth_network_peers::{NodeRecord, pk2id};
 use secp256k1::{SECP256K1, SecretKey, rand};
+use std::fs::File;
 use std::io::ErrorKind;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
+
+use reth_discv4::{DiscoveryUpdate, Discv4, Discv4ConfigBuilder};
+use reth_network_peers::sepolia_nodes;
+use serde::Serialize;
+use std::collections::HashSet;
+use tokio::sync::Semaphore;
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::{EnvFilter, fmt};
 
 type P2p = P2PStream<ECIESStream<TcpStream>>;
 //
@@ -42,10 +51,27 @@ type P2p = P2PStream<ECIESStream<TcpStream>>;
 //
 // Address: 188.68.32.16 is the netcup relay, which forwards these ports to zbox. From this machine itself, dial 127.0.0.1 with the same key and port.
 // Pinned in the repo: only the Sepolia enode is pinned on main (in NetworkConfig.java and rust/myotis-net/src/el/reader.rs), and it matches the live one. The mainnet and Gnosis enodes are not pinned anywhere.
+fn init_logging() {
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,ethp2p_crawl=debug")),
+        )
+        .with_file(false)
+        .with_line_number(false)
+        .with_target(false)
+        // .with_ansi(false)
+        // .with_timer(fmt::time::UtcTime::rfc_3339())   // needs the "time" feature; or drop this line for the default local-ish timestamp
+        .event_format(
+            fmt::format()
+                .with_file(true) // …and on again inside the format
+                .with_line_number(true)
+                .compact(),
+        )
+        .init();
+}
 
-async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
-    let our_key = SecretKey::new(&mut rand::thread_rng());
-
+async fn probe(enode: NodeRecord, our_key: SecretKey) -> anyhow::Result<ProbeOutcome> {
     let tcp =
         match timeout(Duration::from_secs(5), TcpStream::connect((enode.address, enode.tcp_port)))
             .await
@@ -96,10 +122,9 @@ async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
 
     // let spec = match chain_arg { "sepolia" => SEPOLIA.as_ref(), _ => MAINNET.as_ref() };
     let spec = SEPOLIA.as_ref(); //SEPOLIA
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let head = Head {
         number: 10_000_000,
-        timestamp: now,
+        timestamp: now(),
         hash: spec.genesis_hash(),
         ..Default::default()
     }; //SEPOLIA
@@ -132,7 +157,7 @@ async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
             .context("decode status")?,
     );
 
-    println!("theirs.forkId: {:?} status.forkId: {:?}", theirs.forkid, status.forkid);
+    debug!("theirs.forkId: {:?} status.forkId: {:?}", theirs.forkid, status.forkid);
 
     let snap = match snap_off {
         None => SnapCheck::NotShared,
@@ -141,9 +166,13 @@ async fn probe(enode: NodeRecord) -> anyhow::Result<ProbeOutcome> {
 
     // Disconnect
     if let Err(e) = p2p_stream.disconnect(DisconnectReason::ClientQuitting).await {
-        eprintln!("Disconnect failed: {:?}", e);
+        debug!("Disconnect failed: {:?}", e);
     }
     Ok(ProbeOutcome::Probed { hello: hello, status: theirs, snap: snap })
+}
+
+pub fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
 #[derive(Debug)]
@@ -168,18 +197,138 @@ pub enum Stage {
     Headers,
     AccountRange,
 }
-
+use std::io::Write;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let enode: NodeRecord = std::env::args().nth(1).unwrap().parse()?;
-    // record.id (PeerId), record.address (IpAddr), record.tcp_port
+    init_logging();
 
-    match tokio::time::timeout(Duration::from_secs(65), probe(enode)).await {
-        Ok(Ok(outcome)) => println!("{outcome:?}"),
-        Ok(Err(e)) => eprintln!("probe failed: {e:#}"),
-        Err(_) => eprintln!("probe timed out"),
+    let our_key = SecretKey::new(&mut rand::thread_rng()); // same key as the probe uses
+    let local = NodeRecord::from_secret_key("0.0.0.0:0".parse()?, &our_key);
+
+    let mut cfg = Discv4ConfigBuilder::default();
+    cfg.add_boot_nodes(sepolia_nodes()) // the five EF bootnodes
+        //.add_boot_nodes(your_file_nodes)       // --boot files
+        .lookup_interval(Duration::from_secs(5))
+        .external_ip_resolver(None); // skip the STUN/UPnP dance
+
+    let discv4 = Discv4::spawn(local.udp_addr(), local, our_key, cfg.build()).await?;
+    let mut updates = discv4.update_stream().await?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<NodeRecord>(1024);
+    tokio::spawn(async move {
+        let mut seen = HashSet::new();
+        while let Some(u) = updates.next().await {
+            // debug!("update: {:?}", &u);
+            match u {
+                DiscoveryUpdate::Added(n) | DiscoveryUpdate::DiscoveredAtCapacity(n) => {
+                    if seen.insert(n.id) {
+                        let _ = tx.send(n).await;
+                    }
+                }
+                DiscoveryUpdate::EnrForkId(n, fork_id) => { /* see §5 */ }
+                DiscoveryUpdate::Batch(us) => {
+                    for u in us {
+                        if let DiscoveryUpdate::Added(n)
+                        | DiscoveryUpdate::DiscoveredAtCapacity(n) = u
+                        {
+                            if seen.insert(n.id) {
+                                let _ = tx.send(n).await;
+                            }
+                        }
+                    }
+                }
+                DiscoveryUpdate::Removed(_) => {}
+            }
+        }
+    });
+
+    let sem = Arc::new(Semaphore::new(16));
+    let results = Arc::new(Mutex::new(File::create("results.jsonl")?));
+    let mut rx = rx;
+
+    while let Some(enode) = rx.recv().await {
+        let permit = sem.clone().acquire_owned().await?;
+        let results = results.clone();
+        tokio::spawn(async move {
+            let enode_str = enode.to_string();
+            let outcome = timeout(Duration::from_secs(65), probe(enode, our_key)).await;
+            let line = Record { enode: enode_str, ts: now(), outcome: to_outcome(outcome) };
+            // let line = Record { enode, ts: now(), outcome: outcome.into() };
+            writeln!(results.lock().unwrap(), "{}", serde_json::to_string(&line).unwrap()).ok();
+            drop(permit);
+        });
     }
+
+    // tokio::time::sleep(Duration::from_millis(50000)).await;
+
+    // let enode: NodeRecord = std::env::args().nth(1).unwrap().parse()?;
+    // // record.id (PeerId), record.address (IpAddr), record.tcp_port
+    //
+    // match tokio::time::timeout(Duration::from_secs(65), probe(enode)).await {
+    //     Ok(Ok(outcome)) => println!("{outcome:?}"),
+    //     Ok(Err(e)) => eprintln!("probe failed: {e:#}"),
+    //     Err(_) => eprintln!("probe timed out"),
+    // }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct Record {
+    enode: String, // NodeRecord's Display gives the enode:// form
+    ts: u64,
+    outcome: Outcome, // a serialisable mirror of ProbeOutcome
+}
+
+#[derive(Serialize, Default)]
+struct Outcome {
+    kind: &'static str, // probed | disconnected | unreachable | reset | key_mismatch | error | timeout
+    client: Option<String>,
+    caps: Vec<String>,
+    chain: Option<u64>,
+    fork_hash: Option<String>,
+    latest: Option<u64>,
+    snap: Option<String>,
+    reason: Option<String>,
+}
+
+fn to_outcome(r: Result<anyhow::Result<ProbeOutcome>, tokio::time::error::Elapsed>) -> Outcome {
+    let mut o = Outcome::default();
+    match r {
+        Err(_) => o.kind = "timeout",
+        Ok(Err(e)) => {
+            o.kind = "error";
+            o.reason = Some(format!("{e:#}"));
+        }
+        Ok(Ok(p)) => match p {
+            ProbeOutcome::Unreachable(k) => {
+                o.kind = "unreachable";
+                o.reason = Some(format!("{k:?}"));
+            }
+            ProbeOutcome::Reset => o.kind = "reset",
+            ProbeOutcome::KeyMismatch => o.kind = "key_mismatch",
+            ProbeOutcome::Disconnected { reason, hello } => {
+                o.kind = "disconnected";
+                o.reason = Some(format!("{reason:?}"));
+                if let Some(h) = hello {
+                    fill_hello(&mut o, &h);
+                }
+            }
+            ProbeOutcome::Probed { hello, status, snap } => {
+                o.kind = "probed";
+                fill_hello(&mut o, &hello);
+                o.chain = Some(status.chain.id());
+                o.fork_hash = Some(format!("{:?}", status.forkid.hash));
+                o.latest = status.latest_block;
+                o.snap = Some(format!("{snap:?}"));
+            }
+        },
+    }
+    o
+}
+
+fn fill_hello(o: &mut Outcome, h: &HelloMessage) {
+    o.client = Some(h.client_version.clone());
+    o.caps = h.capabilities.iter().map(|c| c.to_string()).collect();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -221,6 +370,9 @@ fn disconnect_reason(e: &P2PStreamError) -> Option<DisconnectReason> {
         _ => None,
     }
 }
+use alloy_rlp::{Decodable, Encodable};
+use tracing::debug;
+use tracing_subscriber::fmt::init;
 
 async fn snap_check(
     p2p: &mut P2p,
