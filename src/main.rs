@@ -157,7 +157,7 @@ async fn probe(enode: NodeRecord, our_key: SecretKey) -> anyhow::Result<ProbeOut
             .context("decode status")?,
     );
 
-    debug!("theirs.forkId: {:?} status.forkId: {:?}", theirs.forkid, status.forkid);
+    // debug!("theirs.forkId: {:?} status.forkId: {:?}", theirs.forkid, status.forkid);
 
     let snap = match snap_off {
         None => SnapCheck::NotShared,
@@ -215,6 +215,12 @@ async fn main() -> anyhow::Result<()> {
     let mut updates = discv4.update_stream().await?;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<NodeRecord>(1024);
+    let mut seen = HashSet::new();                // moved out of the task
+    for arg in std::env::args().skip(1) {
+        let seed: NodeRecord = arg.parse()?;      // enode://…@host:port
+        seen.insert(seed.id);                     // so discovery doesn't queue it twice
+        tx.send(seed).await?;                     // probed right away
+    }
     tokio::spawn(async move {
         let mut seen = HashSet::new();
         while let Some(u) = updates.next().await {
