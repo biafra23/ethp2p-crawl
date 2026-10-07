@@ -1,4 +1,4 @@
-use alloy_primitives::B256;
+use alloy_primitives::{B256, ChainId};
 use anyhow::{Context, anyhow};
 use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
@@ -30,6 +30,9 @@ use std::collections::HashSet;
 use tokio::sync::Semaphore;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{EnvFilter, fmt};
+
+use clap::Parser;
+use std::path::{Path, PathBuf};
 
 type P2p = P2PStream<ECIESStream<TcpStream>>;
 //
@@ -152,23 +155,30 @@ async fn probe(enode: NodeRecord, our_key: SecretKey) -> anyhow::Result<ProbeOut
         None => return Err(anyhow!("stream closed before status")),
     };
 
-    let theirs = UnifiedStatus::from_message(
+    let their_status = UnifiedStatus::from_message(
         ProtocolMessage::<EthNetworkPrimitives>::decode_status(eth_version, &mut &frame[..])
             .context("decode status")?,
     );
 
     // debug!("theirs.forkId: {:?} status.forkId: {:?}", theirs.forkid, status.forkid);
 
+    if their_status.chain.id() != 11155111 {
+        return Ok(ProbeOutcome::Probed {
+            hello: hello,
+            status: their_status,
+            snap: SnapCheck::WrongChain,
+        });
+    }
     let snap = match snap_off {
         None => SnapCheck::NotShared,
-        Some(off) => snap_check(&mut p2p_stream, eth_version, off, theirs.blockhash).await?,
+        Some(off) => snap_check(&mut p2p_stream, eth_version, off, their_status.blockhash).await?,
     };
 
     // Disconnect
     if let Err(e) = p2p_stream.disconnect(DisconnectReason::ClientQuitting).await {
         debug!("Disconnect failed: {:?}", e);
     }
-    Ok(ProbeOutcome::Probed { hello: hello, status: theirs, snap: snap })
+    Ok(ProbeOutcome::Probed { hello: hello, status: their_status, snap: snap })
 }
 
 pub fn now() -> u64 {
@@ -191,6 +201,7 @@ pub enum SnapCheck {
     Empty,                                          // answered, but nothing for that root
     Timeout,
     Disconnected { reason: DisconnectReason, stage: Stage },
+    WrongChain, // not Sepolia
 }
 #[derive(Debug)]
 pub enum Stage {
@@ -201,28 +212,39 @@ use std::io::Write;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_logging();
+    let args = Args::parse();
 
     let our_key = SecretKey::new(&mut rand::thread_rng()); // same key as the probe uses
     let local = NodeRecord::from_secret_key("0.0.0.0:0".parse()?, &our_key);
+    let (tx, rx) = tokio::sync::mpsc::channel::<NodeRecord>(1024);
+    let mut seen = HashSet::new(); // moved out of the task
 
     let mut cfg = Discv4ConfigBuilder::default();
-    cfg.add_boot_nodes(sepolia_nodes()) // the five EF bootnodes
-        //.add_boot_nodes(your_file_nodes)       // --boot files
-        .lookup_interval(Duration::from_secs(5))
-        .external_ip_resolver(None); // skip the STUN/UPnP dance
+    cfg.add_boot_nodes(sepolia_nodes());
+
+    if let Some(seed_file_name) = args.seeds {
+        debug!("seed-file: {:?}", seed_file_name);
+        let seeds = load_seeds(&seed_file_name)?;
+        cfg.add_boot_nodes(seeds.clone());
+        // seen.insert(seed_file_name);
+        for seed in seeds {
+            if seen.insert(seed.id) {
+                tx.send(seed).await?;
+            }
+        }
+    }
+    cfg.lookup_interval(Duration::from_secs(5)).external_ip_resolver(None); // skip the STUN/UPnP dance
 
     let discv4 = Discv4::spawn(local.udp_addr(), local, our_key, cfg.build()).await?;
     let mut updates = discv4.update_stream().await?;
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<NodeRecord>(1024);
-    let mut seen = HashSet::new();                // moved out of the task
-    for arg in std::env::args().skip(1) {
-        let seed: NodeRecord = arg.parse()?;      // enode://…@host:port
-        seen.insert(seed.id);                     // so discovery doesn't queue it twice
-        tx.send(seed).await?;                     // probed right away
+    for enode in args.enodes {
+        let seed: NodeRecord = enode; // enode://…@host:port
+        debug!("enodes: {:?}", seed);
+        seen.insert(seed.id); // so discovery doesn't queue it twice
+        tx.send(seed).await?; // probed right away
     }
     tokio::spawn(async move {
-        let mut seen = HashSet::new();
         while let Some(u) = updates.next().await {
             // debug!("update: {:?}", &u);
             match u {
@@ -258,6 +280,13 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let enode_str = enode.to_string();
             let outcome = timeout(Duration::from_secs(65), probe(enode, our_key)).await;
+            if let Ok(Ok(ProbeOutcome::Probed { hello, status, snap })) = &outcome {
+                // debug!("ProbeOutcome::Probed");
+                // debug!("Client: {:?}, ProbeOutcome::Probed.snap={:?}", hello.client_version, snap);
+                // debug!("Client: {:?}, ProbeOutcome::Probed.snap={:?}", hello., snap);
+                debug!("Chain: {:?}, ProbeOutcome::Probed.snap={:?}", status.chain.id(), snap);
+            }
+
             let line = Record { enode: enode_str, ts: now(), outcome: to_outcome(outcome) };
             // let line = Record { enode, ts: now(), outcome: outcome.into() };
             writeln!(results.lock().unwrap(), "{}", serde_json::to_string(&line).unwrap()).ok();
@@ -481,4 +510,23 @@ async fn wait_for(p2p: &mut P2p, want_id: u8, secs: u64) -> anyhow::Result<Recv>
             },
         }
     }
+}
+
+#[derive(Parser)]
+struct Args {
+    /// File with one enode per line; '#' starts a comment
+    #[arg(long)]
+    seeds: Option<PathBuf>,
+    /// Enodes to probe right away
+    enodes: Vec<NodeRecord>,
+}
+
+fn load_seeds(path: &Path) -> anyhow::Result<Vec<NodeRecord>> {
+    std::fs::read_to_string(path)
+        .with_context(|| format!("read {}", path.display()))?
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.parse::<NodeRecord>().with_context(|| format!("bad enode: {l}")))
+        .collect()
 }
