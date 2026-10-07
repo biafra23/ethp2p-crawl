@@ -1,8 +1,8 @@
-use alloy_primitives::{B256, ChainId};
+use alloy_primitives::B256;
 use anyhow::{Context, anyhow};
 use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
-use reth_chainspec::{Head, MAINNET, SEPOLIA};
+use reth_chainspec::{Head, SEPOLIA};
 use reth_ecies::ECIESErrorImpl;
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::errors::{P2PHandshakeError, P2PStreamError};
@@ -28,7 +28,6 @@ use reth_network_peers::sepolia_nodes;
 use serde::Serialize;
 use std::collections::HashSet;
 use tokio::sync::Semaphore;
-use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use clap::Parser;
@@ -241,8 +240,9 @@ async fn main() -> anyhow::Result<()> {
     for enode in args.enodes {
         let seed: NodeRecord = enode; // enode://…@host:port
         debug!("enodes: {:?}", seed);
-        seen.insert(seed.id); // so discovery doesn't queue it twice
-        tx.send(seed).await?; // probed right away
+        if seen.insert(seed.id) {
+            tx.send(seed).await?;
+        }
     }
     tokio::spawn(async move {
         while let Some(u) = updates.next().await {
@@ -253,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
                         let _ = tx.send(n).await;
                     }
                 }
-                DiscoveryUpdate::EnrForkId(n, fork_id) => { /* see §5 */ }
+                DiscoveryUpdate::EnrForkId(_n, _) => { /* see §5 */ }
                 DiscoveryUpdate::Batch(us) => {
                     for u in us {
                         if let DiscoveryUpdate::Added(n)
@@ -280,7 +280,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let enode_str = enode.to_string();
             let outcome = timeout(Duration::from_secs(65), probe(enode, our_key)).await;
-            if let Ok(Ok(ProbeOutcome::Probed { hello, status, snap })) = &outcome {
+            if let Ok(Ok(ProbeOutcome::Probed { hello: _, status, snap })) = &outcome {
                 // debug!("ProbeOutcome::Probed");
                 // debug!("Client: {:?}, ProbeOutcome::Probed.snap={:?}", hello.client_version, snap);
                 // debug!("Client: {:?}, ProbeOutcome::Probed.snap={:?}", hello., snap);
@@ -407,7 +407,6 @@ fn disconnect_reason(e: &P2PStreamError) -> Option<DisconnectReason> {
 }
 use alloy_rlp::{Decodable, Encodable};
 use tracing::debug;
-use tracing_subscriber::fmt::init;
 
 async fn snap_check(
     p2p: &mut P2p,
