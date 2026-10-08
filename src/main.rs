@@ -2,7 +2,7 @@ use alloy_primitives::B256;
 use anyhow::{Context, anyhow};
 use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
-use reth_chainspec::{Head, SEPOLIA};
+use reth_chainspec::{ChainSpec, Head, SEPOLIA};
 use reth_ecies::ECIESErrorImpl;
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::errors::{P2PHandshakeError, P2PStreamError};
@@ -124,12 +124,7 @@ async fn probe(enode: NodeRecord, our_key: SecretKey) -> anyhow::Result<ProbeOut
 
     // let spec = match chain_arg { "sepolia" => SEPOLIA.as_ref(), _ => MAINNET.as_ref() };
     let spec = SEPOLIA.as_ref(); //SEPOLIA
-    let head = Head {
-        number: 10_000_000,
-        timestamp: now(),
-        hash: spec.genesis_hash(),
-        ..Default::default()
-    }; //SEPOLIA
+    let head = sepolia_head(spec); //SEPOLIA
     let mut status = UnifiedStatus::spec_builder(spec, &head);
     status.set_eth_version(eth_version);
 
@@ -178,6 +173,10 @@ async fn probe(enode: NodeRecord, our_key: SecretKey) -> anyhow::Result<ProbeOut
         debug!("Disconnect failed: {:?}", e);
     }
     Ok(ProbeOutcome::Probed { hello: hello, status: their_status, snap: snap })
+}
+
+fn sepolia_head(spec: &ChainSpec) -> Head {
+    Head { number: 10_000_000, timestamp: now(), hash: spec.genesis_hash(), ..Default::default() }
 }
 
 pub fn now() -> u64 {
@@ -244,16 +243,17 @@ async fn main() -> anyhow::Result<()> {
             tx.send(seed).await?;
         }
     }
+    let fork_filter = SEPOLIA.fork_filter(sepolia_head(SEPOLIA.as_ref()));
     tokio::spawn(async move {
         while let Some(u) = updates.next().await {
             // debug!("update: {:?}", &u);
             match u {
-                DiscoveryUpdate::Added(n) | DiscoveryUpdate::DiscoveredAtCapacity(n) => {
-                    if seen.insert(n.id) {
+                DiscoveryUpdate::Added(_) | DiscoveryUpdate::DiscoveredAtCapacity(_) => {}
+                DiscoveryUpdate::EnrForkId(n, fork_id) => {
+                    if fork_filter.validate(fork_id).is_ok() && seen.insert(n.id) {
                         let _ = tx.send(n).await;
                     }
                 }
-                DiscoveryUpdate::EnrForkId(_n, _) => { /* see §5 */ }
                 DiscoveryUpdate::Batch(us) => {
                     for u in us {
                         if let DiscoveryUpdate::Added(n)
